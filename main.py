@@ -9,30 +9,39 @@ from fastapi import (
     HTTPException,
 )
 from starlette.requests import Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 from starlette.middleware.sessions import SessionMiddleware
 import shutil
-from pdf import upload_to_gemini, generate_topics
+from pdf import (
+    upload_to_gemini,
+    generate_topics,
+    generate_topic_notes,
+    generate_quiz,
+    extract_images_from_pdf,
+)
 from passlib.context import CryptContext
 import logging
 from db import hash_password, verify_password
 from fastapi.templating import Jinja2Templates
-from pdf import generate_notes
+from pdf import generate_subtopic_notes
 from dotenv import load_dotenv
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+import html
 
 load_dotenv()
-
+logging.basicConfig(level=logging.INFO)
 
 # Set up FastAPI
 app = FastAPI()
 # Mount the static directory
 app.mount("/static", StaticFiles(directory="static"), name="static")
+# Mount the images directory
+app.mount("/images", StaticFiles(directory="uploads"), name="images")
 
 # Add session middleware (from starlette)
 app.add_middleware(SessionMiddleware, secret_key="your_secret_key_here")
@@ -127,10 +136,6 @@ async def login(
     request.session["username"] = user["username"]
 
     return RedirectResponse(url="/", status_code=302)
-
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 
 
 @app.get("/logout")
@@ -253,7 +258,7 @@ async def home(request: Request):
 
 @app.post("/upload_pdf/")
 async def upload_pdf(request: Request, file: UploadFile = File(...)):
-    """Handle PDF upload and store file details in the database."""
+    """Handle PDF upload, extract images, and store file details in the database."""
     username = request.session.get("username")
     if not username:
         return JSONResponse(
@@ -268,14 +273,21 @@ async def upload_pdf(request: Request, file: UploadFile = File(...)):
             status_code=400,
         )
 
-    # Ensure the upload folder exists
-    upload_folder = Path("uploads")
-    upload_folder.mkdir(exist_ok=True)
+    # Create a unique folder for the user
+    user_folder = Path("uploads") / username
+    user_folder.mkdir(parents=True, exist_ok=True)
 
-    # Save the file locally
-    file_path = upload_folder / file.filename  # type: ignore
+    # Create a folder for images
+    images_folder = user_folder / "images"
+    images_folder.mkdir(exist_ok=True)
+
+    # Save the file locally in the user's folder
+    file_path = user_folder / os.path.basename(str(file.filename))
     with file_path.open("wb") as f:
         shutil.copyfileobj(file.file, f)
+
+    # Extract images from the PDF
+    image_files = extract_images_from_pdf(file_path, images_folder)
 
     # Store the PDF path and username in the 'pdfs' table
     conn = get_db_connection()
@@ -309,8 +321,11 @@ async def upload_pdf(request: Request, file: UploadFile = File(...)):
 
     uploaded_file = upload_to_gemini(file_path)
 
-    # Store only the file name in the session
-    request.session["uploaded_file_name"] = file_path.name
+    # Store the file path and image files relative to the uploads folder in the session
+    request.session["uploaded_file_path"] = str(file_path.relative_to(Path("uploads")))
+    request.session["image_files"] = [
+        str(Path(img).relative_to(Path("uploads"))) for img in image_files
+    ]
 
     # Generate topics after file upload
     topics_data = generate_topics(uploaded_file)
@@ -397,126 +412,201 @@ async def upload_pdf(request: Request, file: UploadFile = File(...)):
     }
 
 
-@app.get("/notes/")
-async def get_notes(request: Request, chapter: str, topic: str, subtopic: str):
-    """Generate notes for the subtopic if not already present and render the notes.html template."""
-    file_name = request.session.get("uploaded_file_name")
-    if not file_name:
-        return HTMLResponse(
-            "No file found in session. Please upload a PDF.", status_code=400
+# Add this function to escape the markdown
+def escape_markdown(text):
+    return html.escape(text)
+
+
+# Add the custom filter to Jinja2
+templates.env.filters["escape_markdown"] = escape_markdown
+
+
+@app.get("/quiz/{chapter}")
+async def quiz_page(request: Request, chapter: str):
+    """Render the quiz page for a specific chapter."""
+    return templates.TemplateResponse(
+        "quiz.html", {"request": request, "chapter": chapter}
+    )
+
+
+@app.get("/api/quiz/{chapter}")
+async def get_quiz(request: Request, chapter: str):
+    """Generate and return a quiz for the specified chapter."""
+    relative_file_path = request.session.get("uploaded_file_path")
+    if not relative_file_path:
+        logging.error("No file found in session")
+        return JSONResponse(
+            content={"error": "No file found in session. Please upload a PDF."},
+            status_code=400,
         )
 
-    # Retrieve the file from storage
-    file_path = Path("uploads") / file_name
+    file_path = Path("uploads") / relative_file_path
     if not file_path.exists():
-        return HTMLResponse(
-            "File not found in storage. Please upload the PDF again.", status_code=400
-        )
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    if not topic.isdigit():
-        cur.execute(
-            """
-        SELECT s.content, t.topicname, s.subtopicname, c.chaptername
-        FROM subtopics s
-        JOIN topics t ON s.topicid = t.topicid
-        JOIN chapters c ON t.chapterid = c.chapterid
-        WHERE c.chaptername = %s AND t.topicname = %s AND s.subtopicname = %s
-        """,
-            (chapter, topic, subtopic),
-        )
-        notes = ""
-        result = cur.fetchone()
-        if result and result[0]:  # If content exists and is not None/empty
-            notes = result[0]
-        else:
-            try:
-                notes = generate_notes(chapter, topic, subtopic, file_path)
-                if not notes.strip():
-                    notes = "No notes generated for this subtopic."
-
-                cur.execute(
-                    """
-                    UPDATE subtopics
-                    SET content = %s
-                    WHERE subtopicname = %s
-                    """,
-                    (notes, subtopic),
-                )
-                conn.commit()
-                cur.close()
-                conn.close()
-            except Exception as e:
-                logging.error(f"Error generating notes: {str(e)}")
-                notes = f"Error generating notes: {str(e)}"
-
-        # Render the template with the generated notes
-        return templates.TemplateResponse(
-            "notes.html",
-            {
-                "request": request,
-                "chapter": chapter,
-                "topic": topic,
-                "subtopic": subtopic,
-                "notes": notes,
+        logging.error(f"File not found: {file_path}")
+        return JSONResponse(
+            content={
+                "error": "File not found in storage. Please upload the PDF again."
             },
+            status_code=400,
         )
-    else:
-        # Fetch the existing subtopic content and the topic and subtopic names from the database
-        cur.execute(
-            """
-            SELECT s.content, t.topicname, s.subtopicname, c.chaptername
-            FROM subtopics s
-            JOIN topics t ON s.topicid = t.topicid
-            JOIN chapters c ON c.chapterid = t.chapterid
-            WHERE s.subtopicid = %s
-            """,
-            (subtopic,),
+
+    try:
+        file = upload_to_gemini(file_path)
+        logging.info(f"Uploaded file to Gemini: {file}")
+        quiz_questions = generate_quiz(file, chapter)
+        logging.info(f"Generated quiz questions: {quiz_questions}")
+        return JSONResponse(content={"questions": quiz_questions})
+    except Exception as e:
+        logging.error(f"Error generating quiz: {str(e)}")
+        return JSONResponse(
+            content={"error": f"Error generating quiz: {str(e)}"}, status_code=500
         )
-        result = cur.fetchone()
-        topic_name = result[1]  # type: ignore
-        subtopic_name = result[2]  # type: ignore
-        notes = ""
-        chapter = result[3]  # type: ignore
-        if result and result[0]:  # If content exists and is not None/empty
-            notes = result[0]
-        else:
-            # Generate notes if no content is found
-            try:
-                notes = generate_notes(chapter, topic_name, subtopic_name, file_path)
-                if not notes.strip():
-                    notes = "No notes generated for this subtopic."
 
-                # Update the subtopic content in the database with the generated notes
-                cur.execute(
-                    """
-                    UPDATE subtopics
-                    SET content = %s
-                    WHERE subtopicid = %s
-                    """,
-                    (notes, subtopic),
-                )
-                conn.commit()
 
-            except Exception as e:
-                logging.error(f"Error generating notes: {str(e)}")
-                notes = f"Error generating notes: {str(e)}"
+@app.get("/topic/{chapter}/{topic}")
+async def topic_page(request: Request, chapter: str, topic: str):
+    """Render the topic page."""
+    return templates.TemplateResponse(
+        "topic.html", {"request": request, "chapter": chapter, "topic": topic}
+    )
 
-        cur.close()
-        conn.close()
-        print(notes)
-        # Render the template with the existing or generated notes
-        return templates.TemplateResponse(
-            "notes.html",
-            {
-                "request": request,
-                "chapter": chapter,
-                "topic": topic_name,  # Pass the correct topic name
-                "subtopic": subtopic_name,  # Pass the correct subtopic name
-                "notes": notes,
+
+@app.get("/subtopic/{chapter}/{topic}/{subtopic}")
+async def subtopic_page(request: Request, chapter: str, topic: str, subtopic: str):
+    """Render the subtopic page."""
+    return templates.TemplateResponse(
+        "subtopic.html",
+        {
+            "request": request,
+            "chapter": chapter,
+            "topic": topic,
+            "subtopic": subtopic,
+        },
+    )
+
+
+@app.get("/api/notes/{chapter}/{topic}/{subtopic}")
+async def get_notes(request: Request, chapter: str, topic: str, subtopic: str):
+    relative_file_path = request.session.get("uploaded_file_path")
+    image_files = request.session.get("image_files", [])
+    username = request.session.get("username")
+    if not relative_file_path or not username:
+        return JSONResponse(
+            content={"error": "No file found in session or user not logged in."},
+            status_code=400,
+        )
+
+    file_path = Path("uploads") / relative_file_path
+    if not file_path.exists():
+        return JSONResponse(
+            content={
+                "error": "File not found in storage. Please upload the PDF again."
             },
+            status_code=400,
         )
+
+    try:
+        result = generate_subtopic_notes(
+            chapter, topic, subtopic, file_path, image_files
+        )
+
+        # Extract the PDF-specific folder name from the first image path
+        if result.get("images"):
+            pdf_folder = Path(result["images"][0]["filename"]).parent.name
+        else:
+            pdf_folder = ""
+
+        # Process image data - keep only the filename and caption
+        images = [
+            {"filename": Path(img["filename"]).name, "caption": img["caption"]}
+            for img in result.get("images", [])
+        ]
+
+        return JSONResponse(
+            content={
+                "notes": result.get("notes", "No notes generated for this subtopic."),
+                "images": images,
+                "username": username,
+                "pdf_folder": pdf_folder,
+            }
+        )
+    except Exception as e:
+        logging.error(f"Error generating notes: {str(e)}")
+        return JSONResponse(
+            content={"error": f"Error generating notes: {str(e)}"},
+            status_code=500,
+        )
+
+
+@app.get("/api/topic_notes/{chapter}/{topic}")
+async def get_topic_notes(request: Request, chapter: str, topic: str):
+    relative_file_path = request.session.get("uploaded_file_path")
+    image_files = request.session.get("image_files", [])
+    username = request.session.get("username")
+    if not relative_file_path or not username:
+        return JSONResponse(
+            content={"error": "No file found in session or user not logged in."},
+            status_code=400,
+        )
+
+    file_path = Path("uploads") / relative_file_path
+    if not file_path.exists():
+        return JSONResponse(
+            content={
+                "error": "File not found in storage. Please upload the PDF again."
+            },
+            status_code=400,
+        )
+
+    try:
+        file = upload_to_gemini(file_path)
+        result = generate_topic_notes(file, chapter, topic, image_files)
+
+        # Extract the PDF-specific folder name from the first image path
+        if result.get("images"):
+            pdf_folder = Path(result["images"][0]["filename"]).parent.name
+        else:
+            pdf_folder = ""
+
+        # Process image data - keep only the filename and caption
+        images = [
+            {"filename": Path(img["filename"]).name, "caption": img["caption"]}
+            for img in result.get("images", [])
+        ]
+
+        return JSONResponse(
+            content={
+                "topic_notes": result.get(
+                    "notes", "No notes generated for this topic."
+                ),
+                "images": images,
+                "username": username,
+                "pdf_folder": pdf_folder,
+            }
+        )
+    except Exception as e:
+        logging.error(f"Error generating topic notes: {str(e)}")
+        return JSONResponse(
+            content={"error": f"Error generating topic notes: {str(e)}"},
+            status_code=500,
+        )
+
+
+# Add a new route to serve images
+@app.get("/{image_name}")
+async def get_image(image_name: str):
+    """Serves images from the uploads folder.
+
+    Args:
+        image_name (str): Image file name
+
+    Returns:
+        FileResponse: File response object
+    """
+    image_path = Path("uploads") / image_name
+    if not image_path.exists():
+        return JSONResponse(content={"error": "Image not found"}, status_code=404)
+    return FileResponse(image_path)
 
 
 @app.delete("/delete_pdf/{pdfid}")
